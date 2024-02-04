@@ -92,7 +92,7 @@ impl Drop for CallRel32Hook {
                 panic!("VirtualProtect restore failed: {:?}", error);
             }
 
-            // Wait a bit, so all threads in the cave can exit it before we free it
+            // Wait a bit, so all threads in the cave can exit it before we free the cave
             thread::sleep(Duration::from_millis(10));
 
             debug!("Freeing cave {:#016x}", self.cave_address as u64);
