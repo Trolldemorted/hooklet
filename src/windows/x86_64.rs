@@ -42,11 +42,11 @@ pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: u64) ->
 
     let shellcode = util::build_far_jump(new_address);
     let cave_address = alloc_codecave(call_address, shellcode.len())?;
-    
+
     debug!("Writing shellcode to cave {:#016x}", cave_address as usize);
     std::ptr::copy_nonoverlapping(shellcode.as_ptr(), cave_address as _, shellcode.len());
 
-    debug!("Patching {:#x} to call cave {:#x}", call_address, cave_address as usize);
+    debug!("Patching {:#08x} to call cave {:#x}", call_address, cave_address as usize);
     let mut old_flags: PAGE_PROTECTION_FLAGS = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
     if !VirtualProtect(call_address as _, 5, PAGE_EXECUTE_READWRITE, &mut old_flags).as_bool() {
         let error: WIN32_ERROR = GetLastError();
