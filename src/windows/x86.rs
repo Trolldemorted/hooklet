@@ -41,9 +41,11 @@ pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: usize) 
     }
     let new_value = new_address.wrapping_sub(call_address + 5); // +5 for the size of the call
     let rel32_ptr: *mut u32 = (call_address + 1) as _;
-    debug!("Patching rel32 at {:#08x}", rel32_ptr as usize);
-    let old_rel32 = rel32_ptr.read_volatile();
-    rel32_ptr.write_volatile(new_value as _);
+    debug!("Reading old rel32 at {:#08x}", rel32_ptr as usize);
+    let old_rel32 = rel32_ptr.read_unaligned();
+    debug!("Writing new rel32 at {:#08x}", rel32_ptr as usize);
+    rel32_ptr.write_unaligned(new_value as _);
+    debug!("Restoring page permissons");
     if !VirtualProtect(call_address as _, 5, old_flags, &mut old_flags).as_bool() {
         let error: WIN32_ERROR = GetLastError();
         error!("VirtualProtect restore failed: {:?}", error);
@@ -71,7 +73,7 @@ impl Drop for CallRel32Hook {
             }
             let rel32_ptr: *mut u32 = (call_address + 1) as _;
             debug!("Patching rel32 at {:#016x}", rel32_ptr as usize);
-            rel32_ptr.write_volatile(self.old_rel32);
+            rel32_ptr.write_unaligned(self.old_rel32);
             if !VirtualProtect(call_address as _, 8, old_flags, &mut old_flags).as_bool() {
                 let error: WIN32_ERROR = GetLastError();
                 panic!("VirtualProtect restore failed: {:?}", error);

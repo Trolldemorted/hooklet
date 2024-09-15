@@ -35,12 +35,12 @@ pub struct CallRel32Hook {
 
 unsafe impl Send for CallRel32Hook {}
 
-pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: u64) -> Result<CallRel32Hook, HookError> {
+pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: usize) -> Result<CallRel32Hook, HookError> {
     let call_base = GetModuleHandleA(module).unwrap();
     let call_address = call_base.0 as usize + offset;
     info!("Hooking rel32 call at {call_address:#016x} to {new_address:#016x}");
 
-    let shellcode = util::build_far_jump(new_address);
+    let shellcode = util::build_far_jump(new_address.try_into().unwrap());
     let cave_address = alloc_codecave(call_address, shellcode.len())?;
 
     debug!("Writing shellcode to cave {:#016x}", cave_address as usize);
