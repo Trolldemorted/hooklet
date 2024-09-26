@@ -13,6 +13,7 @@ pub enum HookError {
     VirtualAllocFailed(WIN32_ERROR),
     VirtualProtectFailed(WIN32_ERROR),
     VirtualQueryFailed(WIN32_ERROR),
+    GetModuleHandleFailed(WIN32_ERROR),
 }
 
 #[derive(Debug)]
@@ -20,6 +21,7 @@ pub struct CallRel32Hook {
     module: PCSTR,
     offset: usize,
     old_rel32: u32,
+    pub old_absolute: usize,
 }
 
 #[derive(Debug)]
@@ -31,9 +33,17 @@ pub enum X86Rel32Type {
 unsafe impl Send for CallRel32Hook {}
 
 pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: usize) -> Result<CallRel32Hook, HookError> {
-    let call_base = GetModuleHandleA(module).unwrap();
+    debug!("GetModuleHandleA {module:?}");
+    let call_base = match GetModuleHandleA(module) {
+        Ok(h) => h,
+        Err(e) => {
+            let error: WIN32_ERROR = GetLastError();
+            error!("GetModuleHandleA failed: {:?} ({e}", error);
+            return Err(HookError::GetModuleHandleFailed(error));
+        }
+    };
     let call_address = call_base.0 as usize + offset;
-    info!("Hooking rel32 call at {call_address:#016x} to {new_address:#016x}");
+    info!("Hooking rel32 call at {call_address:#08x} to {new_address:#08x}");
 
     debug!("Patching {:#08x} to call address {:#x}", call_address, new_address);
     let mut old_flags: PAGE_PROTECTION_FLAGS = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
@@ -55,7 +65,9 @@ pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: usize) 
         return Err(HookError::VirtualProtectFailed(error));
     }
 
-    Ok(CallRel32Hook { module, offset, old_rel32 })
+    let old_absolute = get_absolute_from_rel32(call_address, old_rel32 as usize);
+
+    Ok(CallRel32Hook { module, offset, old_rel32, old_absolute })
 }
 
 impl Drop for CallRel32Hook {
@@ -86,7 +98,7 @@ impl Drop for CallRel32Hook {
 /// The page of the patch will be set to RWX while patching is in progress. This function does not yet check
 /// whether the patch crosses a page boundary.
 pub unsafe fn deploy_rel32_raw(patch_address: usize, target_address: usize, reltype: X86Rel32Type) -> Result<(), HookError> {
-    let rel32 = build_rel32(patch_address, target_address);
+    let rel32 = get_rel32_from_absolute(patch_address, target_address);
 
     let mut patch: [u8; 5] = [0; 5];
     match reltype {
@@ -120,7 +132,13 @@ pub unsafe fn deploy_rel32_raw(patch_address: usize, target_address: usize, relt
 ///
 /// * `patch_address`: The address of the new jump or call instruction
 /// * `target_address`: The address the new jump or call will target
-pub fn build_rel32(patch_address: usize, target_address: usize) -> [u8; 4] {
+pub fn get_rel32_from_absolute(patch_address: usize, target_address: usize) -> [u8; 4] {
+    //todo usizes will wrap incorrectly on x64, use u32?
     let relative_address = target_address.wrapping_sub(patch_address).wrapping_sub(5);
     relative_address.to_le_bytes()
+}
+
+pub fn get_absolute_from_rel32(rel32_address: usize, rel32: usize) -> usize {
+    //todo usizes will wrap incorrectly on x64, use u32?
+    rel32_address.wrapping_add(rel32).wrapping_add(5)
 }
