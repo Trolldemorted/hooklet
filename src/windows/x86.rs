@@ -19,9 +19,16 @@ pub enum HookError {
 #[derive(Debug)]
 pub struct CallRel32Hook {
     module: PCSTR,
-    offset: usize,
+    offset: u32,
     old_rel32: u32,
-    pub old_absolute: usize,
+    pub old_absolute: u32,
+}
+
+#[derive(Debug)]
+pub struct FunctionPointerHook {
+    module: PCSTR,
+    offset: u32,
+    pub old_absolute: u32,
 }
 
 #[derive(Debug)]
@@ -32,7 +39,9 @@ pub enum X86Rel32Type {
 
 unsafe impl Send for CallRel32Hook {}
 
-pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: usize) -> Result<CallRel32Hook, HookError> {
+unsafe impl Send for FunctionPointerHook {}
+
+pub unsafe fn hook_call_rel32(module: PCSTR, offset: u32, new_address: u32) -> Result<CallRel32Hook, HookError> {
     debug!("GetModuleHandleA {module:?}");
     let call_base = match GetModuleHandleA(module) {
         Ok(h) => h,
@@ -42,32 +51,20 @@ pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: usize) 
             return Err(HookError::GetModuleHandleFailed(error));
         }
     };
-    let call_address = call_base.0 as usize + offset;
+    let call_address = call_base.0 as u32 + offset;
     info!("Hooking rel32 call at {call_address:#08x} to {new_address:#08x}");
 
-    debug!("Patching {:#08x} to call address {:#x}", call_address, new_address);
-    let mut old_flags: PAGE_PROTECTION_FLAGS = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-    if !VirtualProtect(call_address as _, 4, PAGE_EXECUTE_READWRITE, &mut old_flags).as_bool() {
-        let error: WIN32_ERROR = GetLastError();
-        error!("VirtualProtect PAGE_EXECUTE_READWRITE failed: {:?}", error);
-        return Err(HookError::VirtualProtectFailed(error));
-    }
     let new_value = new_address.wrapping_sub(call_address + 5); // +5 for the size of the call
-    let rel32_ptr: *mut u32 = (call_address + 1) as _;
-    debug!("Reading old rel32 at {:#08x}", rel32_ptr as usize);
-    let old_rel32 = rel32_ptr.read_unaligned();
-    debug!("Writing new rel32 at {:#08x}", rel32_ptr as usize);
-    rel32_ptr.write_unaligned(new_value as _);
-    debug!("Restoring page permissions");
-    if !VirtualProtect(call_address as _, 5, old_flags, &mut old_flags).as_bool() {
-        let error: WIN32_ERROR = GetLastError();
-        error!("VirtualProtect restore failed: {:?}", error);
-        return Err(HookError::VirtualProtectFailed(error));
-    }
+    let old_rel32_bytes = replace_slice_rwx(call_address + 1, &new_value.to_le_bytes()).unwrap();
+    let old_rel32 = u32::from_le_bytes(old_rel32_bytes);
+    let old_absolute = get_absolute_from_rel32(call_address, old_rel32);
 
-    let old_absolute = get_absolute_from_rel32(call_address, old_rel32 as usize);
-
-    Ok(CallRel32Hook { module, offset, old_rel32, old_absolute })
+    Ok(CallRel32Hook {
+        module,
+        offset,
+        old_rel32,
+        old_absolute,
+    })
 }
 
 impl Drop for CallRel32Hook {
@@ -75,20 +72,39 @@ impl Drop for CallRel32Hook {
         unsafe {
             info!("Dropping {:?}", self);
             let call_base = GetModuleHandleA(self.module).unwrap();
-            let call_address = call_base.0 as usize + self.offset;
+            let call_address = call_base.0 as u32 + self.offset;
 
-            let mut old_flags: PAGE_PROTECTION_FLAGS = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-            if !VirtualProtect(call_address as _, 8, PAGE_EXECUTE_READWRITE, &mut old_flags).as_bool() {
-                let error: WIN32_ERROR = GetLastError();
-                panic!("VirtualProtect PAGE_EXECUTE_READWRITE failed: {:?}", error);
-            }
-            let rel32_ptr: *mut u32 = (call_address + 1) as _;
-            debug!("Patching rel32 at {:#016x}", rel32_ptr as usize);
-            rel32_ptr.write_unaligned(self.old_rel32);
-            if !VirtualProtect(call_address as _, 8, old_flags, &mut old_flags).as_bool() {
-                let error: WIN32_ERROR = GetLastError();
-                panic!("VirtualProtect restore failed: {:?}", error);
-            }
+            replace_slice_rwx(call_address + 1, &self.old_rel32.to_le_bytes()).unwrap();
+        }
+    }
+}
+
+pub unsafe fn hook_function_pointer(module: PCSTR, offset: u32, new_address: u32) -> Result<FunctionPointerHook, HookError> {
+    debug!("GetModuleHandleA {module:?}");
+    let module_base = match GetModuleHandleA(module) {
+        Ok(h) => h,
+        Err(e) => {
+            let error: WIN32_ERROR = GetLastError();
+            error!("GetModuleHandleA failed: {:?} ({e}", error);
+            return Err(HookError::GetModuleHandleFailed(error));
+        }
+    };
+    let fpointer_address = module_base.0 as u32 + offset;
+    info!("Hooking function pointer at {fpointer_address:#08x} to {new_address:#08x}");
+
+    let old_absolute_bytes = replace_slice_rwx(fpointer_address, &new_address.to_le_bytes())?;
+    let old_absolute = u32::from_le_bytes(old_absolute_bytes);
+
+    Ok(FunctionPointerHook { module, offset, old_absolute })
+}
+
+impl Drop for FunctionPointerHook {
+    fn drop(&mut self) {
+        unsafe {
+            info!("Dropping {:?}", self);
+            let module_base = GetModuleHandleA(self.module).unwrap();
+            let pointer_address = module_base.0 as u32 + self.offset;
+            replace_slice_rwx(pointer_address, &self.old_absolute.to_le_bytes()).unwrap();
         }
     }
 }
@@ -97,7 +113,7 @@ impl Drop for CallRel32Hook {
 ///
 /// The page of the patch will be set to RWX while patching is in progress. This function does not yet check
 /// whether the patch crosses a page boundary.
-pub unsafe fn deploy_rel32_raw(patch_address: usize, target_address: usize, reltype: X86Rel32Type) -> Result<(), HookError> {
+pub unsafe fn deploy_rel32_raw(patch_address: u32, target_address: u32, reltype: X86Rel32Type) -> Result<(), HookError> {
     let rel32 = get_rel32_from_absolute(patch_address, target_address);
 
     let mut patch: [u8; 5] = [0; 5];
@@ -106,23 +122,9 @@ pub unsafe fn deploy_rel32_raw(patch_address: usize, target_address: usize, relt
         X86Rel32Type::Jump => patch[0] = 0xe9,
     }
     patch[1..5].copy_from_slice(&rel32);
-    let patch_ptr: *mut u8 = patch_address as _;
 
-    let mut old_flags: PAGE_PROTECTION_FLAGS = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
-    if !VirtualProtect(patch_ptr as _, 5, PAGE_EXECUTE_READWRITE, &mut old_flags).as_bool() {
-        let error: WIN32_ERROR = GetLastError();
-        error!("VirtualProtect PAGE_EXECUTE_READWRITE failed: {:?}", error);
-        return Err(HookError::VirtualProtectFailed(error));
-    }
+    replace_slice_rwx(patch_address, &patch)?;
 
-    debug!("Deploying rel32 patch to {patch_address:X?}");
-    patch_ptr.copy_from(patch.as_ptr(), patch.len());
-
-    if !VirtualProtect(patch_ptr as _, 5, old_flags, &mut old_flags).as_bool() {
-        let error: WIN32_ERROR = GetLastError();
-        error!("VirtualProtect restore failed: {:?}", error);
-        return Err(HookError::VirtualProtectFailed(error));
-    }
     Ok(())
 }
 
@@ -132,13 +134,39 @@ pub unsafe fn deploy_rel32_raw(patch_address: usize, target_address: usize, relt
 ///
 /// * `patch_address`: The address of the new jump or call instruction
 /// * `target_address`: The address the new jump or call will target
-pub fn get_rel32_from_absolute(patch_address: usize, target_address: usize) -> [u8; 4] {
-    //todo usizes will wrap incorrectly on x64, use u32?
+pub fn get_rel32_from_absolute(patch_address: u32, target_address: u32) -> [u8; 4] {
     let relative_address = target_address.wrapping_sub(patch_address).wrapping_sub(5);
     relative_address.to_le_bytes()
 }
 
-pub fn get_absolute_from_rel32(rel32_address: usize, rel32: usize) -> usize {
-    //todo usizes will wrap incorrectly on x64, use u32?
+pub fn get_absolute_from_rel32(rel32_address: u32, rel32: u32) -> u32 {
     rel32_address.wrapping_add(rel32).wrapping_add(5)
+}
+
+pub unsafe fn replace_slice_rwx<const LEN: usize>(destination: u32, data: &[u8; LEN]) -> Result<[u8; LEN], HookError> {
+    let destination_ptr: *mut u8 = destination as _;
+    let mut old_data = [0; LEN];
+
+    debug!("Setting page permissions to RWX");
+    let mut old_flags: PAGE_PROTECTION_FLAGS = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(0);
+    if !VirtualProtect(destination as _, LEN, PAGE_EXECUTE_READWRITE, &mut old_flags).as_bool() {
+        let error: WIN32_ERROR = GetLastError();
+        error!("VirtualProtect PAGE_EXECUTE_READWRITE failed: {:?}", error);
+        return Err(HookError::VirtualProtectFailed(error));
+    }
+
+    debug!("Reading old bytes");
+    destination_ptr.copy_to(old_data.as_mut_ptr(), LEN);
+
+    debug!("Writing new bytes");
+    destination_ptr.copy_from(data.as_ptr(), LEN);
+
+    debug!("Setting page permissions to old value");
+    if !VirtualProtect(destination as _, LEN, old_flags, &mut old_flags).as_bool() {
+        let error: WIN32_ERROR = GetLastError();
+        error!("VirtualProtect restore failed: {:?}", error);
+        return Err(HookError::VirtualProtectFailed(error));
+    }
+
+    Ok(old_data)
 }

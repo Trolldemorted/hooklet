@@ -40,7 +40,7 @@ pub unsafe fn hook_call_rel32(module: PCSTR, offset: usize, new_address: usize) 
     let call_address = call_base.0 as usize + offset;
     info!("Hooking rel32 call at {call_address:#016x} to {new_address:#016x}");
 
-    let shellcode = util::build_far_jump(new_address.try_into().unwrap());
+    let shellcode = util::build_x86_64_far_jump(new_address);
     let cave_address = alloc_codecave(call_address, shellcode.len())?;
 
     debug!("Writing shellcode to cave {:#016x}", cave_address as usize);

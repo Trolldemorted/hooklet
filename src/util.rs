@@ -1,6 +1,5 @@
-#[cfg(target_arch = "x86_64")]
 // Credits to https://stackoverflow.com/a/775124/1569755 and https://stackoverflow.com/a/36511513/1569755
-pub unsafe fn build_far_jump(destination_address: usize) -> [u8; 0x13] {
+pub fn build_x86_64_far_jump(destination_address: usize) -> [u8; 0x13] {
     let mut code: [u8; 0x13] = [
         0x50, // push     rax
         0x50, // push     rax
