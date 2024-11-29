@@ -44,7 +44,7 @@ unsafe impl Send for CallRel32Hook {}
 unsafe impl Send for FunctionPointerHook {}
 
 /// Hook an x86 call (e8) or jmp (e9) instruction.
-/// 
+///
 /// * `offset`` - Offset of the instruction relative to the executable's base address
 /// * `new_address` - Absolute address of the new target
 pub unsafe fn hook_call_rel32(offset: u32, new_address: u32) -> Result<CallRel32Hook, HookError> {
