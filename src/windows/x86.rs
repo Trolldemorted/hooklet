@@ -1,5 +1,9 @@
+use std::fmt::Debug;
+use std::ptr;
+
 use log::{debug, error, info};
-use windows::Win32::System::LibraryLoader::GetModuleHandleA;
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetModuleHandleW};
 use windows::{
     core::PCSTR,
     Win32::{
@@ -18,16 +22,14 @@ pub enum HookError {
 
 #[derive(Debug)]
 pub struct CallRel32Hook {
-    module: PCSTR,
-    offset: u32,
+    call_address: u32,
     old_rel32: u32,
     pub old_absolute: u32,
 }
 
 #[derive(Debug)]
 pub struct FunctionPointerHook {
-    module: PCSTR,
-    offset: u32,
+    fpointer_address: u32,
     pub old_absolute: u32,
 }
 
@@ -41,27 +43,47 @@ unsafe impl Send for CallRel32Hook {}
 
 unsafe impl Send for FunctionPointerHook {}
 
-pub unsafe fn hook_call_rel32(module: PCSTR, offset: u32, new_address: u32) -> Result<CallRel32Hook, HookError> {
-    debug!("GetModuleHandleA {module:?}");
-    let call_base = match GetModuleHandleA(module) {
+/// Hook an x86 call (e8) or jmp (e9) instruction.
+/// 
+/// * `offset`` - Offset of the instruction relative to the executable's base address
+/// * `new_address` - Absolute address of the new target
+pub unsafe fn hook_call_rel32(offset: u32, new_address: u32) -> Result<CallRel32Hook, HookError> {
+    let call_base = match GetModuleHandleW(PCWSTR::from_raw(ptr::null())) {
         Ok(h) => h,
         Err(e) => {
             let error: WIN32_ERROR = GetLastError();
-            error!("GetModuleHandleA failed: {:?} ({e}", error);
+            error!("GetModuleHandleW failed: {:?} ({e}", error);
             return Err(HookError::GetModuleHandleFailed(error));
         }
     };
     let call_address = call_base.0 as u32 + offset;
-    info!("Hooking rel32 call at {call_address:#08x} to {new_address:#08x}");
+    hook_call_rel32_inner(call_address, new_address)
+}
 
+pub unsafe fn hook_call_rel32_with_module<P: Into<HSTRING> + Debug>(module: P, offset: u32, new_address: u32) -> Result<CallRel32Hook, HookError> {
+    let module = module.into();
+    debug!("GetModuleHandleW {module:?}");
+    let call_base = match GetModuleHandleW(&module) {
+        Ok(h) => h,
+        Err(e) => {
+            let error: WIN32_ERROR = GetLastError();
+            error!("GetModuleHandleW failed: {:?} ({e}", error);
+            return Err(HookError::GetModuleHandleFailed(error));
+        }
+    };
+    let call_address = call_base.0 as u32 + offset;
+    hook_call_rel32_inner(call_address, new_address)
+}
+
+unsafe fn hook_call_rel32_inner(call_address: u32, new_address: u32) -> Result<CallRel32Hook, HookError> {
+    info!("Hooking rel32 call at {call_address:#08x} to {new_address:#08x}");
     let new_value = new_address.wrapping_sub(call_address + 5); // +5 for the size of the call
     let old_rel32_bytes = replace_slice_rwx(call_address + 1, &new_value.to_le_bytes()).unwrap();
     let old_rel32 = u32::from_le_bytes(old_rel32_bytes);
     let old_absolute = get_absolute_from_rel32(call_address, old_rel32);
 
     Ok(CallRel32Hook {
-        module,
-        offset,
+        call_address,
         old_rel32,
         old_absolute,
     })
@@ -71,15 +93,25 @@ impl Drop for CallRel32Hook {
     fn drop(&mut self) {
         unsafe {
             info!("Dropping {:?}", self);
-            let call_base = GetModuleHandleA(self.module).unwrap();
-            let call_address = call_base.0 as u32 + self.offset;
-
-            replace_slice_rwx(call_address + 1, &self.old_rel32.to_le_bytes()).unwrap();
+            replace_slice_rwx(self.call_address + 1, &self.old_rel32.to_le_bytes()).unwrap();
         }
     }
 }
 
-pub unsafe fn hook_function_pointer(module: PCSTR, offset: u32, new_address: u32) -> Result<FunctionPointerHook, HookError> {
+pub unsafe fn hook_function_pointer(offset: u32, new_address: u32) -> Result<FunctionPointerHook, HookError> {
+    let module_base = match GetModuleHandleW(PCWSTR::from_raw(ptr::null())) {
+        Ok(h) => h,
+        Err(e) => {
+            let error: WIN32_ERROR = GetLastError();
+            error!("GetModuleHandleA failed: {:?} ({e}", error);
+            return Err(HookError::GetModuleHandleFailed(error));
+        }
+    };
+    let fpointer_address = module_base.0 as u32 + offset;
+    hook_function_pointer_inner(fpointer_address, new_address)
+}
+
+pub unsafe fn hook_function_pointer_width_module(module: PCSTR, offset: u32, new_address: u32) -> Result<FunctionPointerHook, HookError> {
     debug!("GetModuleHandleA {module:?}");
     let module_base = match GetModuleHandleA(module) {
         Ok(h) => h,
@@ -90,21 +122,25 @@ pub unsafe fn hook_function_pointer(module: PCSTR, offset: u32, new_address: u32
         }
     };
     let fpointer_address = module_base.0 as u32 + offset;
-    info!("Hooking function pointer at {fpointer_address:#08x} to {new_address:#08x}");
+    hook_function_pointer_inner(fpointer_address, new_address)
+}
 
+pub unsafe fn hook_function_pointer_inner(fpointer_address: u32, new_address: u32) -> Result<FunctionPointerHook, HookError> {
+    info!("Hooking function pointer at {fpointer_address:#08x} to {new_address:#08x}");
     let old_absolute_bytes = replace_slice_rwx(fpointer_address, &new_address.to_le_bytes())?;
     let old_absolute = u32::from_le_bytes(old_absolute_bytes);
 
-    Ok(FunctionPointerHook { module, offset, old_absolute })
+    Ok(FunctionPointerHook {
+        fpointer_address,
+        old_absolute,
+    })
 }
 
 impl Drop for FunctionPointerHook {
     fn drop(&mut self) {
         unsafe {
             info!("Dropping {:?}", self);
-            let module_base = GetModuleHandleA(self.module).unwrap();
-            let pointer_address = module_base.0 as u32 + self.offset;
-            replace_slice_rwx(pointer_address, &self.old_absolute.to_le_bytes()).unwrap();
+            replace_slice_rwx(self.fpointer_address, &self.old_absolute.to_le_bytes()).unwrap();
         }
     }
 }
