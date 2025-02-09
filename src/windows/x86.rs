@@ -206,3 +206,51 @@ pub unsafe fn replace_slice_rwx<const LEN: usize>(destination: u32, data: &[u8; 
 
     Ok(old_data)
 }
+
+#[macro_export]
+macro_rules! save_volatile_registers_except_eax {
+    ($function_name:ident, $symbol_name:ident) => {
+        extern "C" {
+            static $symbol_name: c_void;
+        }
+
+        std::arch::global_asm!("
+.global {detour_symbol}
+{detour_symbol}:
+pushfd
+push ecx
+push edx
+call {function_symbol}
+pop edx
+pop ecx
+popfd
+ret
+",
+            detour_symbol = sym $symbol_name,
+            function_symbol = sym $function_name,
+        );
+    };
+}
+
+#[macro_export]
+macro_rules! save_volatile_registers {
+    ($function_name:ident, $symbol_name:ident) => {
+        extern "C" {
+            static $symbol_name: c_void;
+        }
+
+        std::arch::global_asm!("
+.global {detour_symbol}
+{detour_symbol}:
+pushfd
+pushad
+call {function_symbol}
+popad
+popfd
+ret
+",
+            detour_symbol = sym $symbol_name,
+            function_symbol = sym $function_name,
+        );
+    };
+}
